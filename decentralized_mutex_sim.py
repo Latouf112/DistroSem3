@@ -130,6 +130,9 @@ class Node:
         self.permanent_down = False
 
         self.fencing_token = 0
+        # logging and duplicate suppression
+        self.processed_msg_ids: Set[str] = set()
+        self.last_waiters_count_log = None
 
     def log(self, event: str, **details):
         ts = round(now(), 3)
@@ -225,6 +228,9 @@ class Node:
         mid = m.get('msg_id')
         if mid:
             await self.msg.ack(mid, addr)
+            if mid in self.processed_msg_ids:
+                return
+            self.processed_msg_ids.add(mid)
         src = m.get('from')
         if src is not None:
             self.last_heard[src] = now()
@@ -263,8 +269,9 @@ class Node:
                 if my < other:
                     defer = True
             if defer:
-                self.deferred.add(j)
-                self.log('defer', from_node=j, ts=t)
+                if j not in self.deferred:
+                    self.deferred.add(j)
+                    self.log('defer', from_node=j, ts=t)
             else:
                 rep = {'type': 'REP', 'view': self.view_id, 'for_ts': t, 'from': self.node_id}
                 await self.msg.send(rep, self.addr(j), reliable=True)
@@ -280,10 +287,11 @@ class Node:
             return
         if mtype == 'REP':
             j = m.get('from')
-            if self.state_want_cs:
+            if self.state_want_cs and j in self.waiters:
                 self.waiters.discard(j)
-                self.log('got_reply', from_node=j, waiters=list(self.waiters))
-                if not self.waiters and not self.state_in_cs:
+                remaining = len(self.waiters)
+                self.log('got_reply', from_node=j, remaining=remaining)
+                if remaining == 0 and not self.state_in_cs:
                     await self.enter_cs()
             return
         if mtype == 'RENEW':
@@ -300,7 +308,7 @@ class Node:
         self.waiters.discard(self.node_id)
         msg = {'type': 'REQ', 'view': self.view_id, 'ts': self.req_ts, 'from': self.node_id}
         await self.broadcast(msg)
-        self.log('broadcast_req', ts=self.req_ts, waiters=list(self.waiters))
+        self.log('broadcast_req', ts=self.req_ts, targets=len(self.waiters))
         if not self.waiters:
             await self.enter_cs()
 
@@ -311,7 +319,7 @@ class Node:
         self.waiters.discard(self.node_id)
         msg = {'type': 'REQ', 'view': self.view_id, 'ts': self.req_ts, 'from': self.node_id}
         await self.broadcast(msg)
-        self.log('rebroadcast_req', ts=self.req_ts, waiters=list(self.waiters))
+        self.log('rebroadcast_req', ts=self.req_ts, targets=len(self.waiters))
 
     async def enter_cs(self):
         self.state_in_cs = True
